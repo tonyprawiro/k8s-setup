@@ -1,0 +1,245 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+PRIMARY_MASTER_ADDRESS = "192.168.205.111"
+
+servers = [
+    {
+        :name => "cks-master-docker",
+        :type => "primarymaster",
+        :box => "ubuntu/bionic64",
+        :box_version => "20201211.1.0",
+        :eth1 => "#{PRIMARY_MASTER_ADDRESS}",
+        :mem => "2048",
+        :cpu => "2"
+    },
+    {
+        :name => "cks-worker-docker",
+        :type => "node",
+        :box => "ubuntu/bionic64",
+        :box_version => "20201211.1.0",
+        :eth1 => "192.168.205.121",
+        :mem => "2048",
+        :cpu => "1"
+    }
+]
+
+# This script to install k8s using kubeadm will get executed after a box is provisioned
+$configureBox = <<-SCRIPT
+    modprobe br_netfilter
+    # Let iptables see bridged traffic
+    cat <<EOFF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOFF
+    sysctl --system
+    echo '1' > /proc/sys/net/ipv4/ip_forward
+
+    # Install Docker
+    mkdir -p /etc/docker
+    cat <<EOF | sudo tee /etc/docker/daemon.json
+{
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "100m"
+    },
+    "storage-driver": "overlay2"
+}
+EOF
+    apt-get update
+    apt-get install -y apt-transport-https ca-certificates curl gnupg gnupg-agent software-properties-common lsb-release
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    add-apt-repository "deb https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(lsb_release -cs) stable"
+    apt-get update && apt-get install -y \
+        docker-ce=$(apt-cache madison docker-ce | grep 19.03 | head -1 | awk '{print $3}') \
+        docker-ce-cli=$(apt-cache madison docker-ce-cli | grep 19.03 | head -1 | awk '{print $3}')
+    usermod -aG docker vagrant
+    systemctl enable docker
+
+    # install kubeadm
+    apt-get install -y apt-transport-https curl
+    curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+    cat <<EOF >/etc/apt/sources.list.d/kubernetes.list
+deb http://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+    apt-get update
+    apt-get install -y kubelet=1.19.0-00 kubeadm=1.19.0-00 kubectl=1.19.0-00
+    apt-mark hold kubelet kubeadm kubectl
+
+    # kubelet requires swap off
+    swapoff -a
+    # keep swap off after reboot
+    sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    # ip of this box
+    IP_ADDR=`ifconfig enp0s8 | grep -i mask | awk '{print $2}'| cut -f2 -d:`
+
+    # gVisor runsc
+    {
+    set -e
+    URL=https://storage.googleapis.com/gvisor/releases/release/20201130.0
+    wget -q ${URL}/runsc ${URL}/runsc.sha512 \
+        ${URL}/gvisor-containerd-shim ${URL}/gvisor-containerd-shim.sha512 \
+        ${URL}/containerd-shim-runsc-v1 ${URL}/containerd-shim-runsc-v1.sha512
+    sha512sum -c runsc.sha512 \
+        -c gvisor-containerd-shim.sha512 \
+        -c containerd-shim-runsc-v1.sha512
+    rm -f *.sha512
+    chmod a+rx runsc gvisor-containerd-shim containerd-shim-runsc-v1
+    sudo mv runsc gvisor-containerd-shim containerd-shim-runsc-v1 /usr/local/bin
+    }
+
+    # docker use runsc
+    # already done in daemon.json
+
+    # kubelet extra config
+    cat <<EOF | sudo tee /etc/default/kubelet
+KUBELET_EXTRA_ARGS="--node-ip=$IP_ADDR"
+EOF
+    systemctl daemon-reload
+    systemctl restart kubelet
+
+    # falco as systemd unit
+    curl -s https://falco.org/repo/falcosecurity-3672BA8F.asc | apt-key add -
+    echo "deb https://dl.bintray.com/falcosecurity/deb stable main" | tee -a /etc/apt/sources.list.d/falcosecurity.list
+    apt-get update -y
+    apt-get -y install linux-headers-$(uname -r)
+    apt-get install -y falco
+
+    echo "set paste" > /home/vagrant/.vimrc
+    echo "set paste" > /root/.vimrc
+SCRIPT
+
+$configurePrimaryMaster = <<-SCRIPT
+    echo "This is primary master"
+
+    # ip of this box
+    IP_ADDR=`ifconfig enp0s8 | grep -i mask | awk '{print $2}'| cut -f2 -d:`
+
+    # generate cert key
+    CERTKEY=$(kubeadm alpha certs certificate-key)
+
+    # install k8s master
+    HOST_NAME=$(hostname -s)
+    kubeadm init --apiserver-advertise-address=$IP_ADDR --control-plane-endpoint #{PRIMARY_MASTER_ADDRESS}:6443 --node-name $HOST_NAME --pod-network-cidr=172.16.0.0/16 --upload-certs --certificate-key $CERTKEY --kubernetes-version 1.19.0
+
+    #copying credentials to regular user - vagrant
+    sudo --user=vagrant mkdir -p /home/vagrant/.kube
+    cp /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+    chown $(id -u vagrant):$(id -g vagrant) /home/vagrant/.kube/config
+    echo alias k=kubectl >> /home/vagrant/.bashrc
+    echo "source <(kubectl completion bash)" >> /home/vagrant/.bashrc
+    echo "complete -F __start_kubectl k" >> /home/vagrant/.bashrc
+    echo "export fg='--force --grace-period=0'" >> /home/vagrant/.bashrc
+    echo "export gf='--force --grace-period=0'" >> /home/vagrant/.bashrc
+    echo "export do='--dry-run=client -o yaml'" >> /home/vagrant/.bashrc
+    echo "export od='--dry-run=client -o yaml'" >> /home/vagrant/.bashrc
+
+    #copying credentials to root
+    mkdir -p /root/.kube
+    cp /etc/kubernetes/admin.conf /root/.kube/config
+    chown $(id -u root):$(id -g root) /root/.kube/config
+    echo alias k=kubectl >> /root/.bashrc
+    echo "source <(kubectl completion bash)" >> /root/.bashrc
+    echo "complete -F __start_kubectl k" >> /root/.bashrc
+    echo "export fg='--force --grace-period=0'" >> /root/.bashrc
+    echo "export gf='--force --grace-period=0'" >> /root/.bashrc
+    echo "export do='--dry-run=client -o yaml'" >> /root/.bashrc
+    echo "export od='--dry-run=client -o yaml'" >> /root/.bashrc
+
+    # Install Weave network addon
+    kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\\n')"
+
+    # Generate node join command script
+    kubeadm token create --print-join-command >> /etc/kubeadm_join_cmd.sh
+    chmod +x /etc/kubeadm_join_cmd.sh
+
+    # Generate control plane join command script
+    echo $(kubeadm token create --print-join-command) --apiserver-advertise-address=\\$1 --control-plane --certificate-key $CERTKEY > /etc/kubeadm_controlplane_cmd.sh
+    chmod +x /etc/kubeadm_controlplane_cmd.sh
+
+    # required for setting up password less ssh between guest VMs
+    sudo sed -i "/^[^#]*PasswordAuthentication[[:space:]]no/c\PasswordAuthentication yes" /etc/ssh/sshd_config
+    sudo service sshd restart
+
+    # kube-bench
+    sudo /usr/bin/curl -s -L https://github.com/aquasecurity/kube-bench/releases/download/v0.3.1/kube-bench_0.3.1_linux_amd64.deb -o /tmp/kube-bench_0.3.1_linux_amd64.deb
+    sudo apt install /tmp/kube-bench_0.3.1_linux_amd64.deb
+
+    # kubesec
+    wget -q https://github.com/controlplaneio/kubesec/releases/download/v2.8.0/kubesec_linux_amd64.tar.gz
+    tar xzf kubesec_linux_amd64.tar.gz
+    sudo mv kubesec /usr/local/bin/
+
+    # conftest
+    wget -q https://github.com/open-policy-agent/conftest/releases/download/v0.21.0/conftest_0.21.0_Linux_x86_64.tar.gz
+    tar xzf conftest_0.21.0_Linux_x86_64.tar.gz
+    sudo mv conftest /usr/local/bin/
+
+    # trivy
+    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+    echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+    sudo apt-get update
+    sudo apt-get install trivy
+
+    # OPA gatekeeper
+    kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.3/deploy/gatekeeper.yaml
+
+    # AppArmor
+    apt install -y apparmor-utils
+
+    # Nginx ingress controller
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v0.44.0/deploy/static/provider/baremetal/deploy.yaml
+
+    # openssl command to generate ssl cert
+    echo "openssl req -x509 -newkey rsa:4096 -keyout secure-ingress.key -out secure-ingress.crt -days 365 -nodes" > /home/vagrant/notes.txt
+SCRIPT
+
+$configureNode = <<-SCRIPT
+    echo "This is worker"
+    apt-get install -y sshpass
+    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@#{PRIMARY_MASTER_ADDRESS}:/etc/kubeadm_join_cmd.sh .
+    sh ./kubeadm_join_cmd.sh
+SCRIPT
+
+$configureBoxExtra = <<-SCRIPT
+
+SCRIPT
+
+Vagrant.configure("2") do |config|
+
+    servers.each do |opts|
+        config.vm.define opts[:name] do |config|
+
+            config.vm.box = opts[:box]
+            config.vm.box_version = opts[:box_version]
+            config.vm.hostname = opts[:name]
+            config.vm.network :private_network, ip: opts[:eth1]
+
+            config.vm.provider "virtualbox" do |v|
+
+                v.name = opts[:name]
+                v.customize ["modifyvm", :id, "--memory", opts[:mem]]
+                v.customize ["modifyvm", :id, "--cpus", opts[:cpu]]
+
+            end
+
+            config.vm.provision "shell", inline: $configureBox
+
+            if opts[:type] == "primarymaster"
+                config.vm.provision "shell", inline: $configurePrimaryMaster
+            elsif opts[:type] == "additionalmaster"
+                config.vm.provision "shell", inline: $configureAdditionalMaster
+            else
+                config.vm.provision "shell", inline: $configureNode
+            end
+
+            config.vm.provision "shell", inline: $configureBoxExtra
+
+            config.vm.box_check_update = false
+        end
+
+    end
+
+end 

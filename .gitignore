@@ -1,2 +1,7 @@
 .vagrant
 *.log
+terraform.tfvars
+*.tfstate
+*.tfstate.backup
+*kubeconfig*
+.terraform
